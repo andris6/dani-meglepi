@@ -1,3 +1,5 @@
+#!/usr/bin/bash
+
 python3 -c "
 import ast
 with open('../dani-meglepi-server.py') as f:
