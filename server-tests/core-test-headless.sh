@@ -1,3 +1,5 @@
+#!/usr/bin/bash
+
 python3 -c "
 import threading, asyncio, time, sys
 
