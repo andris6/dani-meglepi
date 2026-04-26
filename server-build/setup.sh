@@ -1,3 +1,5 @@
+#!/usr/bin/bash
+
 pip3 install fastapi uvicorn pyinstaller
 
 curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
