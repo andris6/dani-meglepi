@@ -1,6 +1,6 @@
 @echo off
 :: ================================================================
-::  dani-meglepi -- Deploy szkript v
+::  dani-meglepi -- Deploy szkript v4
 ::  Admin mód:   SYSTEM Task, HKCU+HKLM registry, rejtett mappa
 ::  User mód:    User Task,   HKCU registry
 :: ================================================================
