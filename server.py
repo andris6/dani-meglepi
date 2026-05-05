@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
 dani-meglepi-server
-Orchesztrálja a dani-meglepi klienseket.
-Tkinter GUI + FastAPI WebSocket szerver + Ngrok alagút.
 """
 
 import asyncio
