@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 """
 dani-meglepi-server
-Orchesztrálja a dani-meglepi klienseket.
-Tkinter GUI + FastAPI WebSocket szerver + Ngrok alagút.
 """
 
 import asyncio
 import json
-import subprocess
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime, timedelta
 from typing import Optional
 import sys
-import os
-import time
 
 # ── Függőség-ellenőrzés ──────────────────────────────────────────────────────
 try:
@@ -23,13 +18,19 @@ try:
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect
     from fastapi.responses import JSONResponse
 except ImportError:
-    print("Hiányzó csomagok! Futtasd: pip install fastapi uvicorn")
+    print("Hiányzó csomagok! Futtasd: pip install fastapi uvicorn ngrok")
+    sys.exit(1)
+
+try:
+    import ngrok as ngrok_sdk
+except ImportError:
+    print("Hiányzó csomag: ngrok. Futtasd: pip install ngrok")
     sys.exit(1)
 
 # ── Konfiguráció ─────────────────────────────────────────────────────────────
 NGROK_AUTHTOKEN = "3CrfFkoxfbzOqvibRPgphslSE5t_6PMdjjxy75gX3Guqi5EYw"
 NGROK_DOMAIN    = "turbulent-renter-liking.ngrok-free.app"
-SERVER_HOST     = "0.0.0.0"
+SERVER_HOST     = "127.0.0.1"
 SERVER_PORT     = 8765
 
 # ── WebSocket kapcsolatkezelő ────────────────────────────────────────────────
@@ -103,72 +104,6 @@ def broadcast_sync(cmd: str):
     if _loop:
         asyncio.run_coroutine_threadsafe(manager.broadcast(cmd), _loop)
 
-# ── Ngrok indítása ───────────────────────────────────────────────────────────
-def find_ngrok() -> Optional[str]:
-    """Megkeresi az ngrok binárist több lehetséges helyen."""
-    candidates = [
-        "ngrok",
-        os.path.expanduser("~/ngrok"),
-        os.path.expanduser("~/.local/bin/ngrok"),
-        "/usr/local/bin/ngrok",
-        "/usr/bin/ngrok",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "ngrok"),
-    ]
-    for c in candidates:
-        try:
-            result = subprocess.run([c, "version"],
-                capture_output=True, timeout=3)
-            if result.returncode == 0:
-                return c
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
-    return None
-
-def start_ngrok(log_fn) -> Optional[subprocess.Popen]:
-    ngrok_bin = find_ngrok()
-    if not ngrok_bin:
-        log_fn("HIBA: 'ngrok' nem talalhato! Telepitsd: https://ngrok.com/download")
-        return None
-
-    log_fn(f"Ngrok: {ngrok_bin}")
-
-    # Authtoken konfigurálása (egyszer kell, de nem árt minden alkalommal)
-    try:
-        r = subprocess.run(
-            [ngrok_bin, "config", "add-authtoken", NGROK_AUTHTOKEN],
-            capture_output=True, timeout=10)
-        if r.returncode == 0:
-            log_fn("Ngrok authtoken: OK")
-        else:
-            log_fn(f"Ngrok authtoken hiba: {r.stderr.decode(errors='replace')}")
-    except Exception as e:
-        log_fn(f"Ngrok authtoken kivetel: {e}")
-
-    # Ngrok indítása
-    try:
-        proc = subprocess.Popen(
-            [
-                ngrok_bin, "http",
-                f"--domain={NGROK_DOMAIN}",
-                str(SERVER_PORT),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        # Rövid várakozás hogy felépüljön a tunnel
-        time.sleep(2)
-        if proc.poll() is not None:
-            # Már kilépett — hiba
-            err = proc.stderr.read().decode(errors='replace')
-            log_fn(f"Ngrok azonnal kilépett! Hiba: {err}")
-            return None
-        log_fn(f"Ngrok fut (PID {proc.pid})")
-        log_fn(f"URL: wss://{NGROK_DOMAIN}/ws/<id>")
-        return proc
-    except Exception as e:
-        log_fn(f"Ngrok inditasi hiba: {e}")
-        return None
-
 # ── Uvicorn szerver ──────────────────────────────────────────────────────────
 _loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -186,48 +121,76 @@ def run_server():
     server = uvicorn.Server(config)
     _loop.run_until_complete(server.serve())
 
+# ── Ngrok Python SDK tunnel ──────────────────────────────────────────────────
+_ngrok_listener = None
+
+def start_ngrok_sdk(log_fn) -> Optional[str]:
+    """
+    Ngrok Python SDK-val indít tunnelt a fix static domain-re.
+    Visszaadja a publikus URL-t, vagy None-t hiba esetén.
+    """
+    global _ngrok_listener
+    try:
+        log_fn("Ngrok SDK: authtoken beallitasa...")
+        ngrok_sdk.set_auth_token(NGROK_AUTHTOKEN)
+
+        log_fn(f"Ngrok SDK: tunnel inditasa -> {NGROK_DOMAIN}...")
+        _ngrok_listener = ngrok_sdk.forward(
+            addr=f"{SERVER_HOST}:{SERVER_PORT}",
+            proto="http",
+            domain=NGROK_DOMAIN,
+        )
+        url = _ngrok_listener.url()
+        log_fn(f"Ngrok tunnel aktiv: {url}")
+        return url
+    except Exception as e:
+        log_fn(f"Ngrok HIBA: {e}")
+        return None
+
 # ── Tkinter GUI ──────────────────────────────────────────────────────────────
 class App(tk.Tk):
     PAD = dict(padx=12, pady=6)
 
     def __init__(self):
         super().__init__()
-        self.ngrok_proc: Optional[subprocess.Popen] = None
-        self.title("dani-meglepi vezérló")
+        self.title("dani-meglepi vezérlo")
         self.resizable(False, False)
         self._schedule_job: Optional[str] = None
-        self._schedule_target = None
 
         manager.on_change = self._refresh_status
         self._build_ui()
         self._refresh_status()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Szerver + ngrok indítása az UI felépítése után
+        # Szerver + ngrok indítása az UI után
         self.after(200, self._start_services)
 
     def _start_services(self):
-        """Uvicorn és ngrok indítása — az UI már látható."""
         # Uvicorn háttérszálban
-        server_thread = threading.Thread(target=run_server, daemon=True)
-        server_thread.start()
-        self._log("WebSocket szerver elindult: ws://0.0.0.0:%d" % SERVER_PORT)
+        threading.Thread(target=run_server, daemon=True).start()
+        self._log(f"WebSocket szerver elinditva: ws://{SERVER_HOST}:{SERVER_PORT}")
 
-        # Rövid várakozás hogy az uvicorn elinduljon
+        # Ngrok tunnel 1 másodperc múlva (uvicorn indulási idő)
         self.after(1000, self._start_ngrok)
 
     def _start_ngrok(self):
-        self._log("Ngrok inditasa...")
-        def do_ngrok():
-            proc = start_ngrok(lambda msg: self.after(0, lambda m=msg: self._log(m)))
-            self.ngrok_proc = proc
-            if proc:
-                self.after(0, lambda: self._lbl_ngrok.config(
-                    text=f"Ngrok: fut (PID {proc.pid})", fg="green"))
-            else:
-                self.after(0, lambda: self._lbl_ngrok.config(
-                    text="Ngrok: HIBA! (lasd naplo)", fg="red"))
-        threading.Thread(target=do_ngrok, daemon=True).start()
+        self._log("Ngrok tunnel inditasa...")
+        def do():
+            url = start_ngrok_sdk(
+                lambda msg: self.after(0, lambda m=msg: self._log(m))
+            )
+            def update():
+                if url:
+                    ws_url = url.replace("https://", "wss://").replace("http://", "ws://")
+                    self._lbl_ngrok.config(
+                        text=f"Ngrok: fut", fg="green")
+                    self._lbl_url.config(
+                        text=f"URL: {ws_url}/ws/<id>")
+                else:
+                    self._lbl_ngrok.config(
+                        text="Ngrok: HIBA! (lasd naplo)", fg="red")
+            self.after(0, update)
+        threading.Thread(target=do, daemon=True).start()
 
     def _build_ui(self):
         # Fejléc
@@ -255,8 +218,8 @@ class App(tk.Tk):
                               sticky="w", **self.PAD)
 
         self._lbl_url = tk.Label(sf,
-                                 text=f"URL: wss://{NGROK_DOMAIN}/ws/<id>",
-                                 font=("Courier", 9), fg="gray")
+            text=f"URL: wss://{NGROK_DOMAIN}/ws/<id>",
+            font=("Courier", 9), fg="gray")
         self._lbl_url.grid(row=2, column=0, columnspan=2,
                             sticky="w", **self.PAD)
 
@@ -271,12 +234,10 @@ class App(tk.Tk):
                   bg="#27ae60", fg="white", activebackground="#2ecc71",
                   command=self._cmd_show, **btn).grid(
                       row=0, column=0, padx=10, pady=8)
-
         tk.Button(ctrl, text="Demo mod",
                   bg="#e67e22", fg="white", activebackground="#f39c12",
                   command=self._cmd_demo, **btn).grid(
                       row=0, column=1, padx=10, pady=8)
-
         tk.Button(ctrl, text="Leallitas",
                   bg="#c0392b", fg="white", activebackground="#e74c3c",
                   command=self._cmd_clear, **btn).grid(
@@ -294,7 +255,8 @@ class App(tk.Tk):
 
         self._hour_var = tk.StringVar(value=datetime.now().strftime("%H"))
         self._min_var  = tk.StringVar(value="00")
-        vcmd = (self.register(lambda v: v=="" or (v.isdigit() and len(v)<=2)), "%P")
+        vcmd = (self.register(
+            lambda v: v=="" or (v.isdigit() and len(v)<=2)), "%P")
 
         tk.Spinbox(tf, from_=0, to=23, width=4, format="%02.0f",
                    textvariable=self._hour_var,
@@ -330,8 +292,7 @@ class App(tk.Tk):
         lf = tk.LabelFrame(self, text="Csatlakozott kliensek", **self.PAD)
         lf.pack(fill=tk.BOTH, expand=True, padx=14, pady=4)
 
-        self._listbox = tk.Listbox(lf, height=6,
-                                   font=("Courier", 9),
+        self._listbox = tk.Listbox(lf, height=6, font=("Courier", 9),
                                    selectmode=tk.NONE, activestyle="none")
         sb = ttk.Scrollbar(lf, orient=tk.VERTICAL,
                            command=self._listbox.yview)
@@ -376,7 +337,6 @@ class App(tk.Tk):
         target = now.replace(hour=h, minute=m, second=0, microsecond=0)
         if target <= now:
             target += timedelta(days=1)
-        self._schedule_target = target
         delta_ms = int((target - now).total_seconds() * 1000)
         if self._schedule_job:
             self.after_cancel(self._schedule_job)
@@ -386,7 +346,7 @@ class App(tk.Tk):
         self._lbl_sched.config(
             text=f"Idozitve: {target.strftime('%H:%M')} ({mins} perc mulva)",
             fg="#2980b9")
-        self._log(f"Idozito: {target.strftime('%H:%M')}")
+        self._log(f"Idozito beallitva: {target.strftime('%H:%M')}")
 
     def _cancel_schedule(self):
         if self._schedule_job:
@@ -407,13 +367,9 @@ class App(tk.Tk):
         self.after(0, self._do_refresh)
 
     def _do_refresh(self):
-        count = manager.client_count()
-        state_map = {
-            "idle": "tetlen",
-            "show": "musor fut",
-            "demo": "demo fut",
-        }
-        self._lbl_clients.config(text=f"Kliensek: {count} db")
+        state_map = {"idle": "tetlen", "show": "musor fut", "demo": "demo fut"}
+        self._lbl_clients.config(
+            text=f"Kliensek: {manager.client_count()} db")
         self._lbl_state.config(
             text=f"Allapot: {state_map.get(manager.current_state, '?')}")
         self._listbox.delete(0, tk.END)
@@ -430,16 +386,18 @@ class App(tk.Tk):
 
     # ── Bezárás ────────────────────────────────────────────────────────────
     def _on_close(self):
-        if messagebox.askokcancel("Kilepes", "Biztosan leallitod a szervert?"):
+        if messagebox.askokcancel("Kilepes",
+                                  "Biztosan leallitod a szervert?"):
             broadcast_sync("clear")
-            if self.ngrok_proc:
-                self.ngrok_proc.terminate()
+            try:
+                ngrok_sdk.kill()
+            except Exception:
+                pass
             self.after(400, self.destroy)
 
 # ── Belépési pont ────────────────────────────────────────────────────────────
 def main():
-    gui = App()
-    gui.mainloop()
+    App().mainloop()
 
 if __name__ == "__main__":
     main()
