@@ -135,11 +135,7 @@ def start_ngrok_sdk(log_fn) -> Optional[str]:
         ngrok_sdk.set_auth_token(NGROK_AUTHTOKEN)
 
         log_fn(f"Ngrok SDK: tunnel inditasa -> {NGROK_DOMAIN}...")
-        _ngrok_listener = ngrok_sdk.forward(
-            addr=f"{SERVER_HOST}:{SERVER_PORT}",
-            proto="http",
-            domain=NGROK_DOMAIN,
-        )
+        _ngrok_listener = ngrok_sdk.forward(f"{SERVER_HOST}:{SERVER_PORT}")
         url = _ngrok_listener.url()
         log_fn(f"Ngrok tunnel aktiv: {url}")
         return url
