@@ -42,7 +42,7 @@
 #include <string.h>
 
 /* ── Konfiguráció ───────────────────────────────────────────────────────── */
-#define WS_HOST         L"turbulent-renter-liking.ngrok-free.app"
+#define WS_HOST         L"dani-meglepi-6mqyi7imna-ew.a.run.app"
 #define WS_PORT         443
 #define WS_PATH_PREFIX  L"/ws/"
 #define ASSET_DIR       L"C:\\Users\\Public\\dani-meglepi\\"
