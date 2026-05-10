@@ -124,17 +124,38 @@ def run_server():
 # ── Ngrok Python SDK tunnel ──────────────────────────────────────────────────
 _ngrok_listener = None
 
+def wait_for_server(host: str, port: int, timeout: float = 15.0) -> bool:
+    """Megvárja amíg az uvicorn ténylegesen elkezd hallgatni."""
+    import socket, time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            s = socket.socket()
+            s.settimeout(1)
+            s.connect((host, port))
+            s.close()
+            return True
+        except OSError:
+            time.sleep(0.2)
+    return False
+
 def start_ngrok_sdk(log_fn) -> Optional[str]:
     """
-    Ngrok Python SDK-val indít tunnelt a fix static domain-re.
-    Visszaadja a publikus URL-t, vagy None-t hiba esetén.
+    Ngrok Python SDK-val indít tunnelt.
+    Megvárja hogy az uvicorn ténylegesen elinduljon, csak utána csatlakozik.
     """
     global _ngrok_listener
     try:
+        log_fn("Uvicorn indulasara var...")
+        if not wait_for_server(SERVER_HOST, SERVER_PORT, timeout=15.0):
+            log_fn("HIBA: Uvicorn nem indult el 15 masodpercen belul!")
+            return None
+        log_fn("Uvicorn: OK, port nyitva.")
+
         log_fn("Ngrok SDK: authtoken beallitasa...")
         ngrok_sdk.set_auth_token(NGROK_AUTHTOKEN)
 
-        log_fn(f"Ngrok SDK: tunnel inditasa -> {NGROK_DOMAIN}...")
+        log_fn("Ngrok SDK: tunnel inditasa...")
         _ngrok_listener = ngrok_sdk.forward(f"{SERVER_HOST}:{SERVER_PORT}")
         url = _ngrok_listener.url()
         log_fn(f"Ngrok tunnel aktiv: {url}")
@@ -166,8 +187,8 @@ class App(tk.Tk):
         threading.Thread(target=run_server, daemon=True).start()
         self._log(f"WebSocket szerver elinditva: ws://{SERVER_HOST}:{SERVER_PORT}")
 
-        # Ngrok tunnel 1 másodperc múlva (uvicorn indulási idő)
-        self.after(1000, self._start_ngrok)
+        # Ngrok indítása (wait_for_server megvárja az uvicornt)
+        self.after(500, self._start_ngrok)
 
     def _start_ngrok(self):
         self._log("Ngrok tunnel inditasa...")
