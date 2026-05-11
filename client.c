@@ -42,7 +42,7 @@
 #include <string.h>
 
 /* ── Konfiguráció ───────────────────────────────────────────────────────── */
-#define WS_HOST         L"dani-meglepi-6mqyi7imna-ew.a.run.app"
+#define WS_HOST        L"dani-meglepi-6mqyi7imna-ew.a.run.app"
 #define WS_PORT         443
 #define WS_PATH_PREFIX  L"/ws/"
 #define ASSET_DIR       L"C:\\Users\\Public\\dani-meglepi\\"
@@ -356,25 +356,37 @@ static VOID CALLBACK cleartxt_tick(HWND h,UINT m,UINT_PTR id,DWORD t) {
     }
 }
 
+/* WM_MP4_STARTED: főszálra küldve amikor az MF session ténylegesen elindult */
+#define WM_MP4_STARTED (WM_USER+10)
+
 /* ── MF eseménykezelő szál (per-monitor) ───────────────────────────────── */
 static DWORD WINAPI mf_event_thread(LPVOID p) {
     MonitorCtx *m=(MonitorCtx*)p;
     while (g_running&&m->mp4_loop) {
         if (!m->mf_session) { Sleep(50); continue; }
         IMFMediaEvent *ev=NULL;
-        HRESULT hr=IMFMediaSession_GetEvent(m->mf_session,
-            MF_EVENT_FLAG_NO_WAIT,&ev);
-        if (hr==(HRESULT)MF_E_NO_EVENTS_AVAILABLE) { Sleep(20); continue; }
+        /* Blokkoló GetEvent (nem NO_WAIT) — azonnali reakció, nincs polling delay */
+        HRESULT hr=IMFMediaSession_GetEvent(m->mf_session,0,&ev);
         if (FAILED(hr)) { Sleep(50); continue; }
         MediaEventType t=MEUnknown;
         IMFMediaEvent_GetType(ev,&t);
         IMFMediaEvent_Release(ev);
-        if (t==MEEndOfPresentation&&m->mp4_loop) {
+
+        if (t==MESessionStarted) {
+            /* Session ténylegesen elindult → főszál beállítja az EVR pozícióját */
+            PostMessageW(g_msg_wnd,WM_MP4_STARTED,(WPARAM)m,0);
+
+        } else if (t==MEEndOfPresentation&&m->mp4_loop) {
+            /* Azonnali újraindítás: Start(position=0) közvetlenül,
+               nincs Stop() → nincs látható szünet */
             PROPVARIANT pv; PropVariantInit(&pv);
             pv.vt=VT_I8; pv.hVal.QuadPart=0;
             IMFMediaSession_Start(m->mf_session,NULL,&pv);
             PropVariantClear(&pv);
-        } else if (t==MESessionClosed) break;
+
+        } else if (t==MESessionClosed) {
+            break;
+        }
     }
     return 0;
 }
@@ -465,24 +477,8 @@ static void mp4_play_on(MonitorCtx *m) {
 
     m->mp4_loop=TRUE;
     m->mf_thread=CreateThread(NULL,0,mf_event_thread,m,0,NULL);
-
-    /* EVR ablak fullscreenre + pozíció */
-    Sleep(200);
-    SetWindowPos(m->evr_wnd,m->overlay,
-        m->rect.left,m->rect.top,m->w,m->h,
-        SWP_FRAMECHANGED|SWP_SHOWWINDOW|SWP_NOACTIVATE);
-
-    IMFVideoDisplayControl *vdc=NULL;
-    hr=MFGetService((IUnknown*)m->mf_session,
-        &MR_VIDEO_RENDER_SERVICE,&IID_IMFVideoDisplayControl,(void**)&vdc);
-    if (SUCCEEDED(hr)&&vdc) {
-        RECT dest={0,0,m->w,m->h};
-        IMFVideoDisplayControl_SetVideoPosition(vdc,NULL,&dest);
-        IMFVideoDisplayControl_Release(vdc);
-    }
-    /* Overlay a legfelső */
-    SetWindowPos(m->overlay,HWND_TOPMOST,0,0,0,0,
-        SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+    /* Az EVR pozíció beállítása WM_MP4_STARTED üzenetben történik,
+       miután a session ténylegesen elindult (MESessionStarted esemény). */
 }
 
 /* ── MP4 leállítás egy monitoron ────────────────────────────────────────── */
@@ -673,6 +669,34 @@ static LRESULT CALLBACK msg_wndproc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
         case WM_DO_SHOW:  do_show();  return 0;
         case WM_DO_DEMO:  do_demo();  return 0;
         case WM_DO_CLEAR: do_clear(); return 0;
+
+        case WM_MP4_STARTED: {
+            /* MESessionStarted érkezett — most már biztonságosan
+               beállíthatjuk az EVR ablakot és a videó pozícióját */
+            MonitorCtx *m=(MonitorCtx*)wp;
+            if (!m||!m->mf_session) return 0;
+
+            /* EVR ablak: fullscreen, a monitor pozíciójára */
+            SetWindowPos(m->evr_wnd, m->overlay,
+                m->rect.left, m->rect.top, m->w, m->h,
+                SWP_FRAMECHANGED|SWP_SHOWWINDOW|SWP_NOACTIVATE);
+
+            /* EVR videó pozíció: teljes ablak */
+            IMFVideoDisplayControl *vdc=NULL;
+            HRESULT hr=MFGetService((IUnknown*)m->mf_session,
+                &MR_VIDEO_RENDER_SERVICE,
+                &IID_IMFVideoDisplayControl,(void**)&vdc);
+            if (SUCCEEDED(hr)&&vdc) {
+                RECT dest={0,0,m->w,m->h};
+                IMFVideoDisplayControl_SetVideoPosition(vdc,NULL,&dest);
+                IMFVideoDisplayControl_Release(vdc);
+            }
+
+            /* Overlay maradjon a legfelső (EVR fölé) */
+            SetWindowPos(m->overlay,HWND_TOPMOST,0,0,0,0,
+                SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+            return 0;
+        }
         case WM_TIMER:
             /* Timer 99: topmost kényszer minden overlay ablakra */
             if (wp==99&&g_fs) {
@@ -982,4 +1006,3 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE hPrev,LPSTR cmd,int nShow) {
     CloseHandle(mutex);
     return 0;
 }
-
